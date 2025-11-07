@@ -649,31 +649,6 @@ function refreshIPPools($params) {
         ];
     }
 }
-                            'available_ips' => $stats['available'],
-                            'last_update' => date('Y-m-d H:i:s')
-                        ]
-                    );
-                $updatedCount++;
-            }
-        }
-        
-        logActivity("IP池信息更新成功，更新了 {$updatedCount} 个池");
-        
-        return [
-            'success' => true,
-            'message' => "成功更新 {$updatedCount} 个IP池的信息",
-            'pools' => $poolStats
-        ];
-        
-    } catch (Exception $e) {
-        logActivity("刷新IP池失败：" . $e->getMessage());
-        return [
-            'success' => false,
-            'message' => '刷新失败：' . $e->getMessage(),
-            'debug' => $e->getTraceAsString()
-        ];
-    }
-}
 
 /**
  * 处理测试迁移
