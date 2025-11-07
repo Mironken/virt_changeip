@@ -114,65 +114,59 @@ function changeVPSIPWithWait($vps_id, $invoiceId, $userId, $hostingId, $targetPo
 
         $vps = $vpsInfo['vs'][$vps_id];
         $oldIPs = $vps['ips'] ?? [];
-        
-        $oldIPv4 = null;
+
+        // 分离IPv4和IPv6地址
+        $oldIPv4List = [];
+        $oldIPv6List = [];
         foreach ($oldIPs as $ipAddr) {
             if (filter_var($ipAddr, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4)) {
-                $oldIPv4 = $ipAddr;
-                break;
+                $oldIPv4List[] = $ipAddr;
+            } elseif (filter_var($ipAddr, FILTER_VALIDATE_IP, FILTER_FLAG_IPV6)) {
+                $oldIPv6List[] = $ipAddr;
             }
         }
 
-        if (!$oldIPv4) {
+        if (empty($oldIPv4List)) {
             return ['success' => false, 'error' => '未找到IPv4地址'];
         }
 
-        logActivity("当前IPv4: {$oldIPv4}");
+        $ipv4Count = count($oldIPv4List);
+        logActivity("当前IPv4地址: " . implode(', ', $oldIPv4List));
+        logActivity("当前IPv6地址: " . (empty($oldIPv6List) ? '无' : implode(', ', $oldIPv6List)));
+        logActivity("需要获取 {$ipv4Count} 个新IPv4地址");
 
-        // 步骤2: 获取新IP - 使用正确的API方法
-        logActivity("步骤2: 获取可用的新IP");
-        
-        if ($targetPool) {
-            $newIP = getAvailableIPFromPool_Fixed($admin, $targetPool, $oldIPv4);
-            if (!$newIP) {
-                return ['success' => false, 'error' => "IP池{$targetPool}没有可用IP"];
+        // 步骤2: 获取新的IPv4地址（与旧IPv4数量相同）
+        logActivity("步骤2: 获取可用的新IPv4地址");
+
+        $newIPv4List = [];
+        for ($i = 0; $i < $ipv4Count; $i++) {
+            $excludeIPs = array_merge($oldIPv4List, $newIPv4List); // 排除旧IP和已获取的新IP
+
+            if ($targetPool) {
+                $newIP = getAvailableIPFromPool_Fixed($admin, $targetPool, implode(',', $excludeIPs));
+            } else {
+                $newIP = getAvailableIP_Fixed($admin, '', implode(',', $excludeIPs));
             }
-        } else {
-            $newIP = getAvailableIP_Fixed($admin, '', $oldIPv4);
+
             if (!$newIP) {
-                return ['success' => false, 'error' => '没有可用IP'];
+                $poolMsg = $targetPool ? "IP池{$targetPool}" : "系统";
+                return ['success' => false, 'error' => "{$poolMsg}可用IP不足，需要{$ipv4Count}个，只获取到{$i}个"];
             }
+
+            $newIPv4List[] = $newIP;
+            logActivity("获取新IPv4 " . ($i + 1) . "/{$ipv4Count}: {$newIP}");
         }
 
-        logActivity("新IP: {$newIP}");
+        // 构建新的IP列表：所有新IPv4 + 所有IPv6
+        $newIPList = array_merge($newIPv4List, $oldIPv6List);
+        logActivity("新IP列表: " . implode(', ', $newIPList));
 
-        // 步骤3: 停止VPS
-        logActivity("步骤3: 停止VPS");
-        $stopResult = $admin->stop($vps_id);
-        
-        if (!isset($stopResult['done']) || !$stopResult['done']) {
-            $errorMsg = isset($stopResult['error']) ? json_encode($stopResult['error']) : '未知错误';
-            return ['success' => false, 'error' => "停止VPS失败: {$errorMsg}"];
-        }
+        // 步骤3: 更换IP配置
+        logActivity("步骤3: 更换IP配置");
 
-        logActivity("VPS已发送停止信号");
-        
-        logActivity("等待VPS完全停止 ({$stopWaitTime}秒)...");
-        sleep($stopWaitTime);
-        
-        $statusCheck = waitForVPSStatus($admin, $vps_id, 'stopped', 30);
-        if ($statusCheck) {
-            logActivity("VPS已确认停止");
-        } else {
-            logActivity("警告: 无法确认VPS停止状态，继续执行");
-        }
-
-        // 步骤4: 更换IP
-        logActivity("步骤4: 更换IP配置");
-        
         $post = [
             'vpsid' => $vps_id,
-            'ips' => [$newIP],
+            'ips' => $newIPList,  // 所有新IPv4 + 保留的IPv6
             'hostname' => $vps['hostname'] ?? '',
             'ram' => $vps['ram'] ?? 512,
             'cores' => $vps['cores'] ?? 1,
@@ -180,17 +174,36 @@ function changeVPSIPWithWait($vps_id, $invoiceId, $userId, $hostingId, $targetPo
         ];
         
         $manageResult = $admin->managevps($post);
-        
+
         if (!isset($manageResult['done']['done']) || !$manageResult['done']['done']) {
-            logActivity("IP更换失败，尝试重启VPS");
-            $admin->start($vps_id);
-            
             $errorMsg = isset($manageResult['error']) ? json_encode($manageResult['error']) : '未知错误';
-            return ['success' => false, 'error' => "IP更换失败: {$errorMsg}"];
+            return ['success' => false, 'error' => "IP配置更新失败: {$errorMsg}"];
         }
 
         logActivity("IP配置已更新");
         sleep(3);
+
+        // 步骤4: 停止VPS
+        logActivity("步骤4: 停止VPS");
+        $stopResult = $admin->stop($vps_id);
+
+        if (!isset($stopResult['done']) || !$stopResult['done']) {
+            logActivity("警告: VPS停止信号发送可能失败");
+            $errorMsg = isset($stopResult['error']) ? json_encode($stopResult['error']) : '未知错误';
+            logActivity("停止错误: {$errorMsg}");
+        } else {
+            logActivity("VPS已发送停止信号");
+        }
+
+        logActivity("等待VPS完全停止 ({$stopWaitTime}秒)...");
+        sleep($stopWaitTime);
+
+        $statusCheck = waitForVPSStatus($admin, $vps_id, 'stopped', 30);
+        if ($statusCheck) {
+            logActivity("VPS已确认停止");
+        } else {
+            logActivity("警告: 无法确认VPS停止状态");
+        }
 
         // 步骤5: 启动VPS
         logActivity("步骤5: 启动VPS");
@@ -232,21 +245,22 @@ function changeVPSIPWithWait($vps_id, $invoiceId, $userId, $hostingId, $targetPo
             'userid' => $userId,
             'productname' => $service->productname ?? '未知产品',
             'vps_id' => $vps_id,
-            'old_ip' => $oldIPv4,
-            'new_ip' => $newIP,
+            'old_ip' => implode(', ', $oldIPv4List),
+            'new_ip' => implode(', ', $newIPv4List),
             'change_time' => date('Y-m-d H:i:s'),
             'fee' => $fee,
             'invoiceid' => $invoiceId,
-            'notes' => $targetPool ? "从IP池{$targetPool}分配" : '自动分配'
+            'notes' => $targetPool ? "从IP池{$targetPool}分配，替换{$ipv4Count}个IPv4" : "自动分配，替换{$ipv4Count}个IPv4"
         ]);
 
         logActivity("═══ IP更换完成 ═══");
-        logActivity("结果: {$oldIPv4} → {$newIP}");
+        logActivity("旧IPv4: " . implode(', ', $oldIPv4List));
+        logActivity("新IPv4: " . implode(', ', $newIPv4List));
 
         return [
             'success' => true,
-            'old_ip' => $oldIPv4,
-            'new_ip' => $newIP
+            'old_ip' => implode(', ', $oldIPv4List),
+            'new_ip' => implode(', ', $newIPv4List)
         ];
 
     } catch (Exception $e) {
