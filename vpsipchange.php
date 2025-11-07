@@ -1113,31 +1113,41 @@ function changeVPSIPFromQueue($task, $params) {
         
         require_once(ROOTDIR . '/modules/servers/virtualizor/sdk/admin.php');
         $admin = new Virtualizor_Admin_API($ip, $key, $pass);
-        
+
+        // 先获取VPS信息以获得所有当前IP
+        $vpsInfo = $admin->listvs(1, 1, array('vpsid' => $task->vps_id));
+        if (!isset($vpsInfo['vs'][$task->vps_id])) {
+            return ['success' => false, 'error' => '无法获取VPS信息'];
+        }
+
+        $vps = $vpsInfo['vs'][$task->vps_id];
+        $oldIPs = $vps['ips'] ?? [];
+
         $newIP = getAvailableIPFromPool($ip, $key, $pass, (int)$task->target_pool, $task->old_ip);
-        
+
         if (!$newIP) {
             return ['success' => false, 'error' => '目标IP池没有可用IP'];
         }
-        
+
+        // 构建新的IP列表：保留所有非被替换的IP
+        $newIPList = [];
+        foreach ($oldIPs as $ipAddr) {
+            if ($ipAddr !== $task->old_ip) {
+                $newIPList[] = $ipAddr;
+            }
+        }
+        $newIPList[] = $newIP;
+
         $stopResult = $admin->stop($task->vps_id);
         if (!isset($stopResult['done']) || !$stopResult['done']) {
             return ['success' => false, 'error' => 'VPS停止失败'];
         }
-        
+
         sleep($stopWait);
-        
-        $vpsInfo = $admin->listvs(1, 1, array('vpsid' => $task->vps_id));
-        if (!isset($vpsInfo['vs'][$task->vps_id])) {
-            $admin->start($task->vps_id);
-            return ['success' => false, 'error' => '无法获取VPS信息'];
-        }
-        
-        $vps = $vpsInfo['vs'][$task->vps_id];
-        
+
         $post = [
             'vpsid' => $task->vps_id,
-            'ips' => [$newIP],
+            'ips' => $newIPList,  // 使用完整的IP列表
             'hostname' => $vps['hostname'] ?? '',
             'ram' => $vps['ram'] ?? 512,
             'cores' => $vps['cores'] ?? 1,

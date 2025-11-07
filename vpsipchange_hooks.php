@@ -128,10 +128,11 @@ function changeVPSIPWithWait($vps_id, $invoiceId, $userId, $hostingId, $targetPo
         }
 
         logActivity("当前IPv4: {$oldIPv4}");
+        logActivity("VPS总IP数量: " . count($oldIPs));
 
         // 步骤2: 获取新IP - 使用正确的API方法
         logActivity("步骤2: 获取可用的新IP");
-        
+
         if ($targetPool) {
             $newIP = getAvailableIPFromPool_Fixed($admin, $targetPool, $oldIPv4);
             if (!$newIP) {
@@ -146,20 +147,33 @@ function changeVPSIPWithWait($vps_id, $invoiceId, $userId, $hostingId, $targetPo
 
         logActivity("新IP: {$newIP}");
 
+        // 构建新的IP列表：保留所有非被替换的IP，添加新IP
+        $newIPList = [];
+        foreach ($oldIPs as $ipAddr) {
+            // 保留所有不是被替换的旧IPv4的IP（包括IPv6和其他IPv4）
+            if ($ipAddr !== $oldIPv4) {
+                $newIPList[] = $ipAddr;
+                logActivity("保留IP: {$ipAddr}");
+            }
+        }
+        // 添加新的IPv4地址
+        $newIPList[] = $newIP;
+        logActivity("新IP列表总数: " . count($newIPList));
+
         // 步骤3: 停止VPS
         logActivity("步骤3: 停止VPS");
         $stopResult = $admin->stop($vps_id);
-        
+
         if (!isset($stopResult['done']) || !$stopResult['done']) {
             $errorMsg = isset($stopResult['error']) ? json_encode($stopResult['error']) : '未知错误';
             return ['success' => false, 'error' => "停止VPS失败: {$errorMsg}"];
         }
 
         logActivity("VPS已发送停止信号");
-        
+
         logActivity("等待VPS完全停止 ({$stopWaitTime}秒)...");
         sleep($stopWaitTime);
-        
+
         $statusCheck = waitForVPSStatus($admin, $vps_id, 'stopped', 30);
         if ($statusCheck) {
             logActivity("VPS已确认停止");
@@ -169,10 +183,10 @@ function changeVPSIPWithWait($vps_id, $invoiceId, $userId, $hostingId, $targetPo
 
         // 步骤4: 更换IP
         logActivity("步骤4: 更换IP配置");
-        
+
         $post = [
             'vpsid' => $vps_id,
-            'ips' => [$newIP],
+            'ips' => $newIPList,  // 使用完整的IP列表，保留所有现有IP
             'hostname' => $vps['hostname'] ?? '',
             'ram' => $vps['ram'] ?? 512,
             'cores' => $vps['cores'] ?? 1,
