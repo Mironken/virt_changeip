@@ -163,53 +163,46 @@ function changeVPSIPWithWait($vps_id, $invoiceId, $userId, $hostingId, $targetPo
 
         logActivity("新IPv4地址: " . implode(', ', $newIPv4List));
 
-        // 步骤3: 停止VPS
-        logActivity("步骤3: 停止VPS");
-        $stopResult = $admin->stop($vps_id);
-        
-        if (!isset($stopResult['done']) || !$stopResult['done']) {
-            $errorMsg = isset($stopResult['error']) ? json_encode($stopResult['error']) : '未知错误';
-            return ['success' => false, 'error' => "停止VPS失败: {$errorMsg}"];
-        }
+        // 步骤3: 更换IP配置
+        logActivity("步骤3: 更换IP配置");
 
-        logActivity("VPS已发送停止信号");
-        
-        logActivity("等待VPS完全停止 ({$stopWaitTime}秒)...");
-        sleep($stopWaitTime);
-        
-        $statusCheck = waitForVPSStatus($admin, $vps_id, 'stopped', 30);
-        if ($statusCheck) {
-            logActivity("VPS已确认停止");
-        } else {
-            logActivity("警告: 无法确认VPS停止状态，继续执行");
-        }
-
-        // 步骤4: 更换IP
-        logActivity("步骤4: 更换IP配置");
-        
-        // 合并新的IPv4和旧的IPv6
-        $allNewIPs = array_merge($newIPv4List, $oldIPv6List);
-        logActivity("最终IP列表: " . implode(', ', $allNewIPs));
-        
         $post = [
             'vpsid' => $vps_id,
             'ips' => $newIPv4List,
             'ips6' => $oldIPv6List,
             'hostname' => $vps['hostname'] ?? '',
         ];
-        
+
         $manageResult = $admin->managevps($post);
-        
+
         if (!isset($manageResult['done']['done']) || !$manageResult['done']['done']) {
-            logActivity("IP更换失败，尝试重启VPS");
-            $admin->start($vps_id);
-            
             $errorMsg = isset($manageResult['error']) ? json_encode($manageResult['error']) : '未知错误';
             return ['success' => false, 'error' => "IP更换失败: {$errorMsg}"];
         }
 
         logActivity("IP配置已更新");
         sleep(3);
+
+        // 步骤4: 停止VPS
+        logActivity("步骤4: 停止VPS");
+        $stopResult = $admin->stop($vps_id);
+
+        if (!isset($stopResult['done']) || !$stopResult['done']) {
+            $errorMsg = isset($stopResult['error']) ? json_encode($stopResult['error']) : '未知错误';
+            return ['success' => false, 'error' => "停止VPS失败: {$errorMsg}"];
+        }
+
+        logActivity("VPS已发送停止信号");
+
+        logActivity("等待VPS完全停止 ({$stopWaitTime}秒)...");
+        sleep($stopWaitTime);
+
+        $statusCheck = waitForVPSStatus($admin, $vps_id, 'stopped', 30);
+        if ($statusCheck) {
+            logActivity("VPS已确认停止");
+        } else {
+            logActivity("警告: 无法确认VPS停止状态，继续执行");
+        }
 
         // 步骤5: 启动VPS
         logActivity("步骤5: 启动VPS");
