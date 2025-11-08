@@ -118,9 +118,31 @@ function vpsipchange_activate() {
                 $table->string('ippool_name', 100);
                 $table->integer('total_ips')->default(0);
                 $table->integer('available_ips')->default(0);
+                $table->integer('ipv4_total')->default(0);
+                $table->integer('ipv4_available')->default(0);
+                $table->integer('ipv6_total')->default(0);
+                $table->integer('ipv6_available')->default(0);
                 $table->datetime('last_update');
                 $table->unique('ippid');
             });
+        }
+
+        // 为现有表添加IPv6字段
+        if (Capsule::schema()->hasTable('mod_vpsipchange_pools')) {
+            if (!Capsule::schema()->hasColumn('mod_vpsipchange_pools', 'ipv4_total')) {
+                Capsule::schema()->table('mod_vpsipchange_pools', function ($table) {
+                    $table->integer('ipv4_total')->default(0)->after('available_ips');
+                    $table->integer('ipv4_available')->default(0)->after('ipv4_total');
+                    $table->integer('ipv6_total')->default(0)->after('ipv4_available');
+                    $table->integer('ipv6_available')->default(0)->after('ipv6_total');
+                });
+
+                // 迁移现有数据：将total_ips和available_ips复制到ipv4字段
+                Capsule::table('mod_vpsipchange_pools')->update([
+                    'ipv4_total' => Capsule::raw('total_ips'),
+                    'ipv4_available' => Capsule::raw('available_ips')
+                ]);
+            }
         }
         
         return ['status' => 'success', 'description' => '模块已激活，数据表已创建'];
@@ -143,11 +165,20 @@ function vpsipchange_output($params) {
             echo "<div class='alert alert-success'>";
             echo "<strong>✓ 刷新成功!</strong> {$result['message']}";
             if (!empty($result['pools'])) {
-                echo "<br><small style='margin-top:8px;display:block;'>找到 " . count($result['pools']) . " 个IP池：";
+                echo "<br><small style='margin-top:8px;display:block;'>找到 " . count($result['pools']) . " 个IP池：</small>";
+                echo "<div style='margin-top:8px;'>";
                 foreach ($result['pools'] as $poolId => $poolData) {
-                    echo " <span class='label label-primary'>[{$poolId}] {$poolData['name']} ({$poolData['total']}个IP, {$poolData['available']}可用)</span>";
+                    $ipv4Info = $poolData['ipv4_total'] > 0 ? "IPv4:{$poolData['ipv4_available']}/{$poolData['ipv4_total']}" : "";
+                    $ipv6Info = $poolData['ipv6_total'] > 0 ? "IPv6:{$poolData['ipv6_available']}/{$poolData['ipv6_total']}" : "";
+                    $separator = ($ipv4Info && $ipv6Info) ? ", " : "";
+
+                    echo "<div style='margin:4px 0;'>";
+                    echo "<span class='label label-primary'>[{$poolId}] {$poolData['name']}</span> ";
+                    if ($ipv4Info) echo "<span class='label label-info'>{$ipv4Info}</span> ";
+                    if ($ipv6Info) echo "<span class='label label-success'>{$ipv6Info}</span>";
+                    echo "</div>";
                 }
-                echo "</small>";
+                echo "</div>";
             }
             echo "</div>";
         } else {
@@ -251,28 +282,61 @@ function displayIPPools($params) {
     }
     
     echo "<table class='table table-striped'>";
-    echo "<thead><tr><th>池ID</th><th>池名称</th><th>总IP数</th><th>可用IP数</th><th>使用率</th><th>最后更新</th></tr></thead>";
+    echo "<thead><tr><th>池ID</th><th>池名称</th><th>IPv4</th><th>IPv4可用</th><th>IPv6</th><th>IPv6可用</th><th>总使用率</th><th>最后更新</th></tr></thead>";
     echo "<tbody>";
     foreach($pools as $pool){
-        $usageRate = $pool->total_ips > 0 ? round(($pool->total_ips - $pool->available_ips) / $pool->total_ips * 100, 2) : 0;
-        $alertClass = $pool->available_ips < 10 ? 'danger' : ($pool->available_ips < 50 ? 'warning' : 'success');
-        
+        $ipv4Total = isset($pool->ipv4_total) ? $pool->ipv4_total : 0;
+        $ipv4Available = isset($pool->ipv4_available) ? $pool->ipv4_available : 0;
+        $ipv6Total = isset($pool->ipv6_total) ? $pool->ipv6_total : 0;
+        $ipv6Available = isset($pool->ipv6_available) ? $pool->ipv6_available : 0;
+
+        $totalIPs = $ipv4Total + $ipv6Total;
+        $availableIPs = $ipv4Available + $ipv6Available;
+        $usageRate = $totalIPs > 0 ? round(($totalIPs - $availableIPs) / $totalIPs * 100, 2) : 0;
+
+        // 根据最少的可用IP数量决定颜色
+        $minAvailable = min($ipv4Available, $ipv6Available);
+        if ($ipv4Total == 0) $minAvailable = $ipv6Available;
+        if ($ipv6Total == 0) $minAvailable = $ipv4Available;
+
+        $alertClass = $minAvailable < 10 ? 'danger' : ($minAvailable < 50 ? 'warning' : 'success');
+
         echo "<tr class='{$alertClass}'>";
         echo "<td><strong>{$pool->ippid}</strong></td>";
         echo "<td>{$pool->ippool_name}</td>";
-        echo "<td>{$pool->total_ips}</td>";
-        echo "<td><strong>{$pool->available_ips}</strong></td>";
+
+        // IPv4信息
+        if ($ipv4Total > 0) {
+            $ipv4UsageRate = round(($ipv4Total - $ipv4Available) / $ipv4Total * 100, 1);
+            echo "<td><span class='label label-info'>{$ipv4Total}</span> <small>({$ipv4UsageRate}%)</small></td>";
+            echo "<td><strong class='text-primary'>{$ipv4Available}</strong></td>";
+        } else {
+            echo "<td><span class='text-muted'>-</span></td>";
+            echo "<td><span class='text-muted'>-</span></td>";
+        }
+
+        // IPv6信息
+        if ($ipv6Total > 0) {
+            $ipv6UsageRate = round(($ipv6Total - $ipv6Available) / $ipv6Total * 100, 1);
+            echo "<td><span class='label label-info'>{$ipv6Total}</span> <small>({$ipv6UsageRate}%)</small></td>";
+            echo "<td><strong class='text-primary'>{$ipv6Available}</strong></td>";
+        } else {
+            echo "<td><span class='text-muted'>-</span></td>";
+            echo "<td><span class='text-muted'>-</span></td>";
+        }
+
         echo "<td>{$usageRate}%</td>";
         echo "<td>{$pool->last_update}</td>";
         echo "</tr>";
     }
     echo "</tbody></table>";
-    
+
     echo "<div class='alert alert-info'>";
     echo "<strong>颜色说明：</strong> ";
-    echo "<span class='label label-danger'>红色</span> 可用IP < 10 | ";
-    echo "<span class='label label-warning'>黄色</span> 可用IP < 50 | ";
-    echo "<span class='label label-success'>绿色</span> 可用IP充足";
+    echo "<span class='label label-danger'>红色</span> 最少可用IP < 10 | ";
+    echo "<span class='label label-warning'>黄色</span> 最少可用IP < 50 | ";
+    echo "<span class='label label-success'>绿色</span> IP充足<br>";
+    echo "<strong>提示：</strong>一个IP池可以同时包含IPv4和IPv6地址，测试时会从同一个池获取所需的IP";
     echo "</div>";
 }
 
@@ -309,11 +373,14 @@ function displayTestMigration($params) {
     echo "<select name='test_source_pool' id='test_source_pool' class='form-control'>";
     echo "<option value=''>选择源IP池...</option>";
     foreach ($pools as $pool) {
-        echo "<option value='{$pool->ippid}'>[{$pool->ippid}] {$pool->ippool_name} (总:{$pool->total_ips})</option>";
+        $ipv4Info = isset($pool->ipv4_total) && $pool->ipv4_total > 0 ? "v4:{$pool->ipv4_total}" : "";
+        $ipv6Info = isset($pool->ipv6_total) && $pool->ipv6_total > 0 ? "v6:{$pool->ipv6_total}" : "";
+        $ipInfo = trim($ipv4Info . ($ipv4Info && $ipv6Info ? "," : "") . $ipv6Info);
+        echo "<option value='{$pool->ippid}'>[{$pool->ippid}] {$pool->ippool_name} ({$ipInfo})</option>";
     }
     echo "</select>";
     echo "</div>";
-    
+
     echo "<div class='form-group'>";
     echo "<label>测试VPS数量</label>";
     echo "<select name='test_count' class='form-control'>";
@@ -322,7 +389,7 @@ function displayTestMigration($params) {
     echo "</select>";
     echo "</div>";
     echo "</div>";
-    
+
     echo "<div id='manual_mode_options' style='display:none;'>";
     echo "<div class='form-group'>";
     echo "<label>VPS ID列表</label>";
@@ -330,13 +397,18 @@ function displayTestMigration($params) {
     echo "<p class='help-block'>输入要测试的VPS ID，每行一个或用逗号分隔，最多10台</p>";
     echo "</div>";
     echo "</div>";
-    
+
     echo "<div class='form-group'>";
     echo "<label>目标IP池</label>";
     echo "<select name='test_target_pool' class='form-control' required>";
     echo "<option value=''>选择目标IP池...</option>";
     foreach ($pools as $pool) {
-        echo "<option value='{$pool->ippid}'>[{$pool->ippid}] {$pool->ippool_name} (可用:{$pool->available_ips})</option>";
+        $ipv4Available = isset($pool->ipv4_available) ? $pool->ipv4_available : 0;
+        $ipv6Available = isset($pool->ipv6_available) ? $pool->ipv6_available : 0;
+        $ipv4Info = isset($pool->ipv4_total) && $pool->ipv4_total > 0 ? "v4:{$ipv4Available}" : "";
+        $ipv6Info = isset($pool->ipv6_total) && $pool->ipv6_total > 0 ? "v6:{$ipv6Available}" : "";
+        $availInfo = trim($ipv4Info . ($ipv4Info && $ipv6Info ? "," : "") . $ipv6Info);
+        echo "<option value='{$pool->ippid}'>[{$pool->ippid}] {$pool->ippool_name} (可用:{$availInfo})</option>";
     }
     echo "</select>";
     echo "</div>";
@@ -438,21 +510,29 @@ function displayBatchOperation($params) {
     echo "<select name='source_pool' class='form-control' required>";
     echo "<option value=''>选择IP池...</option>";
     foreach ($pools as $pool) {
-        echo "<option value='{$pool->ippid}'>{$pool->ippool_name} (ID:{$pool->ippid}, 总:{$pool->total_ips})</option>";
+        $ipv4Info = isset($pool->ipv4_total) && $pool->ipv4_total > 0 ? "v4:{$pool->ipv4_total}" : "";
+        $ipv6Info = isset($pool->ipv6_total) && $pool->ipv6_total > 0 ? "v6:{$pool->ipv6_total}" : "";
+        $ipInfo = trim($ipv4Info . ($ipv4Info && $ipv6Info ? "," : "") . $ipv6Info);
+        echo "<option value='{$pool->ippid}'>{$pool->ippool_name} (ID:{$pool->ippid}, {$ipInfo})</option>";
     }
     echo "</select>";
     echo "<p class='help-block'>选择包含需要更换IP的VPS所在的IP池</p>";
     echo "</div>";
-    
+
     echo "<div class='form-group'>";
     echo "<label>目标IP段（更换到的IP段）</label>";
     echo "<select name='target_pool' class='form-control' required>";
     echo "<option value=''>选择IP池...</option>";
     foreach ($pools as $pool) {
-        echo "<option value='{$pool->ippid}'>{$pool->ippool_name} (ID:{$pool->ippid}, 可用:{$pool->available_ips})</option>";
+        $ipv4Available = isset($pool->ipv4_available) ? $pool->ipv4_available : 0;
+        $ipv6Available = isset($pool->ipv6_available) ? $pool->ipv6_available : 0;
+        $ipv4Info = isset($pool->ipv4_total) && $pool->ipv4_total > 0 ? "v4:{$ipv4Available}" : "";
+        $ipv6Info = isset($pool->ipv6_total) && $pool->ipv6_total > 0 ? "v6:{$ipv6Available}" : "";
+        $availInfo = trim($ipv4Info . ($ipv4Info && $ipv6Info ? "," : "") . $ipv6Info);
+        echo "<option value='{$pool->ippid}'>{$pool->ippool_name} (ID:{$pool->ippid}, 可用:{$availInfo})</option>";
     }
     echo "</select>";
-    echo "<p class='help-block'>选择新IP将从哪个IP池分配</p>";
+    echo "<p class='help-block'>选择新IP将从哪个IP池分配（将获取相同数量的IPv4和IPv6）</p>";
     echo "</div>";
     
     echo "<div class='checkbox'>";
@@ -600,45 +680,73 @@ function refreshIPPools($params) {
         $ippools = $poolsData['ippools'];
         $poolStats = [];
         $updatedCount = 0;
-        
-        // 直接使用API返回的totalip和freeip
+
+        // 处理所有IP池，统计IPv4和IPv6
         foreach ($ippools as $poolId => $poolData) {
-            // 只处理IPv4池（跳过IPv6）
-            if (isset($poolData['ipv6']) && $poolData['ipv6'] == '1') {
-                continue;
+            // 获取该池的所有IP详细信息
+            $ipsData = $admin->ips(1, 5000, ['ippid' => $poolId]);
+
+            $ipv4Total = 0;
+            $ipv4Available = 0;
+            $ipv6Total = 0;
+            $ipv6Available = 0;
+
+            if (isset($ipsData['ips']) && !empty($ipsData['ips'])) {
+                foreach ($ipsData['ips'] as $ipInfo) {
+                    $isIPv4 = filter_var($ipInfo['ip'], FILTER_VALIDATE_IP, FILTER_FLAG_IPV4);
+                    $isIPv6 = filter_var($ipInfo['ip'], FILTER_VALIDATE_IP, FILTER_FLAG_IPV6);
+                    $isFree = (!isset($ipInfo['vpsid']) || $ipInfo['vpsid'] == 0) &&
+                              (!isset($ipInfo['locked']) || $ipInfo['locked'] == 0);
+
+                    if ($isIPv4) {
+                        $ipv4Total++;
+                        if ($isFree) {
+                            $ipv4Available++;
+                        }
+                    } elseif ($isIPv6) {
+                        $ipv6Total++;
+                        if ($isFree) {
+                            $ipv6Available++;
+                        }
+                    }
+                }
             }
-            
-            $totalip = isset($poolData['totalip']) ? (int)$poolData['totalip'] : 0;
-            $freeip = isset($poolData['freeip']) ? (int)$poolData['freeip'] : 0;
-            
-            if ($totalip > 0) {
+
+            // 只存储有IP的池
+            if ($ipv4Total > 0 || $ipv6Total > 0) {
                 Capsule::table('mod_vpsipchange_pools')
                     ->updateOrInsert(
                         ['ippid' => $poolId],
                         [
                             'ippid' => $poolId,
                             'ippool_name' => $poolData['ippool_name'] ?? 'Unknown',
-                            'total_ips' => $totalip,
-                            'available_ips' => $freeip,
+                            'total_ips' => $ipv4Total + $ipv6Total,
+                            'available_ips' => $ipv4Available + $ipv6Available,
+                            'ipv4_total' => $ipv4Total,
+                            'ipv4_available' => $ipv4Available,
+                            'ipv6_total' => $ipv6Total,
+                            'ipv6_available' => $ipv6Available,
                             'last_update' => date('Y-m-d H:i:s')
                         ]
                     );
-                
+
                 $poolStats[$poolId] = [
                     'name' => $poolData['ippool_name'] ?? 'Unknown',
-                    'total' => $totalip,
-                    'available' => $freeip
+                    'ipv4_total' => $ipv4Total,
+                    'ipv4_available' => $ipv4Available,
+                    'ipv6_total' => $ipv6Total,
+                    'ipv6_available' => $ipv6Available
                 ];
-                
+
                 $updatedCount++;
             }
         }
-        
-        logActivity("IP池信息更新成功，更新了 {$updatedCount} 个IPv4池");
-        
+
+        logActivity("IP池信息更新成功，更新了 {$updatedCount} 个IP池");
+
         return [
             'success' => true,
-            'message' => "成功更新 {$updatedCount} 个IP池的信息（仅IPv4）",
+            'message' => "成功更新 {$updatedCount} 个IP池的信息（包含IPv4和IPv6统计）",
             'pools' => $poolStats
         ];
         
