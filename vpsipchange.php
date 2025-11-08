@@ -353,13 +353,13 @@ function displayTestMigration($params) {
     echo "<ol>";
     echo "<li><strong>自动模式：</strong>从源IP池中查找已使用的IP对应的VPS进行测试</li>";
     echo "<li><strong>手动模式：</strong>指定具体的VPS ID进行测试</li>";
-    echo "<li><strong>多IP支持：</strong>自动检测VPS的IPv4数量，替换相同数量的新IP</li>";
-    echo "<li><strong>IPv6保护：</strong>自动保留所有IPv6地址不变</li>";
-    echo "<li>每台VPS将执行：停止→换IP→<strong>暂停等待</strong>→启动</li>";
+    echo "<li><strong>多IP支持：</strong>自动检测VPS的IPv4和IPv6数量，替换相同数量的新IP</li>";
+    echo "<li><strong>完整更换：</strong>同时更换所有IPv4和IPv6地址</li>";
+    echo "<li>每台VPS将执行：换IP→停止→<strong>暂停等待</strong>→启动</li>";
     echo "<li>测试过程会详细记录每个步骤</li>";
     echo "<li><strong>注意：测试会实际停止和重启VPS</strong></li>";
     echo "<li>建议先选择测试环境的VPS</li>";
-    echo "<li>确保目标IP池有足够的可用IP（多IP VPS需要更多）</li>";
+    echo "<li>确保目标IP池有足够的IPv4和IPv6（多IP VPS需要更多）</li>";
     echo "</ol>";
     echo "</div></div></div>";
     
@@ -833,41 +833,61 @@ function processTestMigration($params) {
             }
             
             $ipv4Count = count($oldIPv4List);
+            $ipv6Count = count($oldIPv6List);
             echo "<p class='text-success'>✓ 获取到VPS配置</p>";
-            echo "<p>→ 检测到 <strong>{$ipv4Count}个IPv4</strong>, <strong>" . count($oldIPv6List) . "个IPv6</strong></p>";
-            
+            echo "<p>→ 检测到 <strong>{$ipv4Count}个IPv4</strong>, <strong>{$ipv6Count}个IPv6</strong></p>";
+
             // 获取多个新IPv4
             echo "<p>→ 获取{$ipv4Count}个新IPv4地址...</p>";
             $newIPv4List = [];
-            $excludeIPs = array_merge($oldIPv4List, []);
-            
+            $excludeIPv4 = array_merge($oldIPv4List, []);
+
             for ($i = 0; $i < $ipv4Count; $i++) {
-                $newIP = getAvailableIPFromPool($ip, $key, $pass, $targetPool, $excludeIPs);
+                $newIP = getAvailableIPFromPool($ip, $key, $pass, $targetPool, $excludeIPv4, 4);
                 if (!$newIP) {
-                    echo "<p class='text-danger'>✗ 失败：目标IP池没有足够的可用IP（需要{$ipv4Count}个，仅获取到{$i}个）</p>";
+                    echo "<p class='text-danger'>✗ 失败：目标IP池没有足够的IPv4（需要{$ipv4Count}个，仅获取到{$i}个）</p>";
                     $admin->start($vpsInfo['vpsid']);
                     echo "</div>";
                     $failCount++;
                     continue 2;
                 }
                 $newIPv4List[] = $newIP;
-                $excludeIPs[] = $newIP;
-                echo "<p class='text-info' style='margin-left:20px;'>  ✓ 获取新IP " . ($i + 1) . "/{$ipv4Count}: <code>{$newIP}</code></p>";
+                $excludeIPv4[] = $newIP;
+                echo "<p class='text-info' style='margin-left:20px;'>  ✓ 获取新IPv4 " . ($i + 1) . "/{$ipv4Count}: <code>{$newIP}</code></p>";
             }
-            
-            echo "<p class='text-success'>✓ 所有新IP获取完成</p>";
-            
+
+            echo "<p class='text-success'>✓ 所有新IPv4获取完成</p>";
+
+            // 获取多个新IPv6
+            $newIPv6List = [];
+            if ($ipv6Count > 0) {
+                echo "<p>→ 获取{$ipv6Count}个新IPv6地址...</p>";
+                $excludeIPv6 = array_merge($oldIPv6List, []);
+
+                for ($i = 0; $i < $ipv6Count; $i++) {
+                    $newIPv6 = getAvailableIPFromPool($ip, $key, $pass, $targetPool, $excludeIPv6, 6);
+                    if (!$newIPv6) {
+                        echo "<p class='text-danger'>✗ 失败：目标IP池没有足够的IPv6（需要{$ipv6Count}个，仅获取到{$i}个）</p>";
+                        $admin->start($vpsInfo['vpsid']);
+                        echo "</div>";
+                        $failCount++;
+                        continue 2;
+                    }
+                    $newIPv6List[] = $newIPv6;
+                    $excludeIPv6[] = $newIPv6;
+                    echo "<p class='text-info' style='margin-left:20px;'>  ✓ 获取新IPv6 " . ($i + 1) . "/{$ipv6Count}: <code>{$newIPv6}</code></p>";
+                }
+
+                echo "<p class='text-success'>✓ 所有新IPv6获取完成</p>";
+            }
+
             // 更换IP
             echo "<p>→ 更换IP配置...</p>";
-            
-            if (!empty($oldIPv6List)) {
-                echo "<p class='text-info' style='margin-left:20px;'>  保留IPv6: <code>" . implode(', ', $oldIPv6List) . "</code></p>";
-            }
-            
+
             $post = [
                 'vpsid' => $vpsInfo['vpsid'],
                 'ips' => $newIPv4List,
-                'ips6' => $oldIPv6List,
+                'ips6' => $newIPv6List,
                 'hostname' => $vps['hostname'] ?? '',
             ];
             
@@ -921,13 +941,18 @@ function processTestMigration($params) {
                 }
             }
             
-            $oldIPsStr = implode(', ', $oldIPv4List);
-            $newIPsStr = implode(', ', $newIPv4List);
-            $notesStr = "测试迁移 #{$vpsNum}";
-            if (!empty($oldIPv6List)) {
-                $notesStr .= " | 保留IPv6: " . implode(', ', $oldIPv6List);
+            // 合并所有旧IP和新IP用于日志
+            $allOldIPs = array_merge($oldIPv4List, $oldIPv6List);
+            $allNewIPs = array_merge($newIPv4List, $newIPv6List);
+
+            $oldIPsStr = implode(', ', $allOldIPs);
+            $newIPsStr = implode(', ', $allNewIPs);
+
+            $notesStr = "测试迁移 #{$vpsNum} | IPv4:{$ipv4Count}个";
+            if ($ipv6Count > 0) {
+                $notesStr .= " | IPv6:{$ipv6Count}个";
             }
-            
+
             Capsule::table('mod_vpsipchange_logs')->insert([
                 'userid' => $userId,
                 'productname' => $productName,
@@ -939,9 +964,12 @@ function processTestMigration($params) {
                 'invoiceid' => 0,
                 'notes' => $notesStr
             ]);
-            
+
             echo "<p class='text-success'><strong>✓ 测试 #{$vpsNum} 完成!</strong></p>";
-            echo "<p class='text-info'><strong>IP变更:</strong> {$oldIPsStr} → {$newIPsStr}</p>";
+            echo "<p class='text-info'><strong>IPv4变更:</strong> " . implode(', ', $oldIPv4List) . " → " . implode(', ', $newIPv4List) . "</p>";
+            if ($ipv6Count > 0) {
+                echo "<p class='text-info'><strong>IPv6变更:</strong> " . implode(', ', $oldIPv6List) . " → " . implode(', ', $newIPv6List) . "</p>";
+            }
             echo "</div>";
             $successCount++;
             
@@ -1250,39 +1278,41 @@ function changeVPSIPFromQueue($task, $params) {
     }
 }
 
-function getAvailableIPFromPool($serverIP, $apiKey, $apiPass, $poolId, $excludeIPs) {
+function getAvailableIPFromPool($serverIP, $apiKey, $apiPass, $poolId, $excludeIPs, $ipVersion = 4) {
     if (!is_array($excludeIPs)) {
         $excludeIPs = [$excludeIPs];
     }
-    
+
     try {
         require_once(ROOTDIR . '/modules/servers/virtualizor/sdk/admin.php');
         $admin = new Virtualizor_Admin_API($serverIP, $apiKey, $apiPass);
-        
+
         $ipsData = $admin->ips(1, 1000, ['ippid' => $poolId]);
-        
+
         if (!isset($ipsData['ips'])) {
             return null;
         }
-        
+
+        $filterFlag = ($ipVersion == 6) ? FILTER_FLAG_IPV6 : FILTER_FLAG_IPV4;
+
         foreach ($ipsData['ips'] as $ipInfo) {
-            if (!filter_var($ipInfo['ip'], FILTER_VALIDATE_IP, FILTER_FLAG_IPV4)) {
+            if (!filter_var($ipInfo['ip'], FILTER_VALIDATE_IP, $filterFlag)) {
                 continue;
             }
-            
+
             $vpsid = isset($ipInfo['vpsid']) ? $ipInfo['vpsid'] : 0;
             $locked = isset($ipInfo['locked']) ? $ipInfo['locked'] : 0;
-            
+
             if ($vpsid == 0 && $locked == 0) {
                 if (!in_array($ipInfo['ip'], $excludeIPs)) {
                     return $ipInfo['ip'];
                 }
             }
         }
-        
+
         return null;
     } catch (Exception $e) {
-        logActivity("获取可用IP失败: " . $e->getMessage());
+        logActivity("获取可用IPv{$ipVersion}失败: " . $e->getMessage());
         return null;
     }
 }
