@@ -1125,63 +1125,92 @@ function changeVPSIPFromQueue($task, $params) {
         $key = $params['admin_api_key'];
         $pass = $params['admin_api_pass'];
         $ip = $params['server_ip'];
-        
+
         $stopWait = (int)($params['stop_wait_time'] ?? 10);
         $startWait = (int)($params['start_wait_time'] ?? 15);
-        
+
         require_once(ROOTDIR . '/modules/servers/virtualizor/sdk/admin.php');
         $admin = new Virtualizor_Admin_API($ip, $key, $pass);
-        
-        $newIP = getAvailableIPFromPool($ip, $key, $pass, (int)$task->target_pool, $task->old_ip);
-        
-        if (!$newIP) {
-            return ['success' => false, 'error' => '目标IP池没有可用IP'];
+
+        // 1. 获取VPS信息
+        $vpsInfo = $admin->listvs(1, 1, array('vpsid' => $task->vps_id));
+        if (!isset($vpsInfo[$task->vps_id])) {
+            return ['success' => false, 'error' => '无法获取VPS信息'];
         }
-        
+
+        $vps = $vpsInfo[$task->vps_id];
+        $oldIPs = $vps['ips'] ?? [];
+
+        // 2. 分离IPv4和IPv6
+        $oldIPv4List = [];
+        $oldIPv6List = [];
+        foreach ($oldIPs as $ipAddr) {
+            if (filter_var($ipAddr, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4)) {
+                $oldIPv4List[] = $ipAddr;
+            } elseif (filter_var($ipAddr, FILTER_VALIDATE_IP, FILTER_FLAG_IPV6)) {
+                $oldIPv6List[] = $ipAddr;
+            }
+        }
+
+        if (empty($oldIPv4List)) {
+            return ['success' => false, 'error' => '未找到IPv4地址'];
+        }
+
+        $ipv4Count = count($oldIPv4List);
+
+        // 3. 获取多个新IPv4（与原有数量相同）
+        $newIPv4List = [];
+        $excludeIPs = array_merge($oldIPv4List, []);
+
+        for ($i = 0; $i < $ipv4Count; $i++) {
+            $newIP = getAvailableIPFromPool($ip, $key, $pass, (int)$task->target_pool, $excludeIPs);
+            if (!$newIP) {
+                return [
+                    'success' => false,
+                    'error' => "目标IP池没有足够的可用IP（需要{$ipv4Count}个，仅获取到{$i}个）"
+                ];
+            }
+            $newIPv4List[] = $newIP;
+            $excludeIPs[] = $newIP;
+        }
+
+        // 4. 更换IP配置（保留IPv6）
+        $post = [
+            'vpsid' => $task->vps_id,
+            'ips' => $newIPv4List,
+            'ips6' => $oldIPv6List,
+            'hostname' => $vps['hostname'] ?? '',
+        ];
+
+        $manageResult = $admin->managevps($post);
+
+        if (!isset($manageResult['done']['done']) || !$manageResult['done']['done']) {
+            return ['success' => false, 'error' => 'IP更换失败'];
+        }
+
+        sleep(3);
+
+        // 5. 停止VPS
         $stopResult = $admin->stop($task->vps_id);
         if (!isset($stopResult['done']) || !$stopResult['done']) {
             return ['success' => false, 'error' => 'VPS停止失败'];
         }
-        
+
         sleep($stopWait);
-        
-        $vpsInfo = $admin->listvs(1, 1, array('vpsid' => $task->vps_id));
-        if (!isset($vpsInfo[$task->vps_id])) {
-            $admin->start($task->vps_id);
-            return ['success' => false, 'error' => '无法获取VPS信息'];
-        }
-        
-        $vps = $vpsInfo[$task->vps_id];
-        
-        $post = [
-            'vpsid' => $task->vps_id,
-            'ips' => [$newIP],
-            'hostname' => $vps['hostname'] ?? '',
-            'ram' => $vps['ram'] ?? 512,
-            'cores' => $vps['cores'] ?? 1,
-            'bandwidth' => $vps['bandwidth'] ?? 0,
-        ];
-        
-        $manageResult = $admin->managevps($post);
-        
-        if (!isset($manageResult['done']['done']) || !$manageResult['done']['done']) {
-            $admin->start($task->vps_id);
-            return ['success' => false, 'error' => 'IP更换失败'];
-        }
-        
-        sleep(3);
-        
+
+        // 6. 启动VPS
         $startResult = $admin->start($task->vps_id);
         if (!isset($startResult['done']) || !$startResult['done']) {
             logActivity("警告: VPS {$task->vps_id} 启动可能失败");
         }
-        
+
         sleep($startWait);
-        
+
+        // 7. 记录日志
         if ($task->userid > 0) {
             $hosting = vpsipchange_findHostingByVPSID($task->vps_id);
             $service = null;
-            
+
             if ($hosting) {
                 $service = Capsule::table('tblhosting')
                     ->join('tblproducts', 'tblproducts.id', '=', 'tblhosting.packageid')
@@ -1189,26 +1218,33 @@ function changeVPSIPFromQueue($task, $params) {
                     ->select('tblproducts.name as productname')
                     ->first();
             }
-            
+
+            $oldIPsStr = implode(', ', $oldIPv4List);
+            $newIPsStr = implode(', ', $newIPv4List);
+            $notesStr = "批量操作：从IP池{$task->target_pool}";
+            if (!empty($oldIPv6List)) {
+                $notesStr .= " | 保留IPv6: " . implode(', ', $oldIPv6List);
+            }
+
             Capsule::table('mod_vpsipchange_logs')->insert([
                 'userid' => $task->userid,
                 'productname' => $service->productname ?? '未知产品',
                 'vps_id' => $task->vps_id,
-                'old_ip' => $task->old_ip,
-                'new_ip' => $newIP,
+                'old_ip' => $oldIPsStr,
+                'new_ip' => $newIPsStr,
                 'change_time' => date('Y-m-d H:i:s'),
                 'fee' => 0,
                 'invoiceid' => $task->invoiceid,
-                'notes' => '批量操作：从IP池' . $task->target_pool
+                'notes' => $notesStr
             ]);
         }
-        
+
         return [
             'success' => true,
-            'old_ip' => $task->old_ip,
-            'new_ip' => $newIP
+            'old_ip' => implode(', ', $oldIPv4List),
+            'new_ip' => implode(', ', $newIPv4List)
         ];
-        
+
     } catch (Exception $e) {
         return ['success' => false, 'error' => $e->getMessage()];
     }
